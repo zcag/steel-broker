@@ -106,10 +106,6 @@ async function closeWindow(targetId) {
   try { const ws = await openBrowserCDP(); const c = cdp(ws); await c.send('Target.closeTarget', { targetId }); ws.close(); } catch {}
 }
 
-async function windowIdOf(targetId) {
-  try { const ws = await openBrowserCDP(); const c = cdp(ws); const { windowId } = await c.send('Browser.getWindowForTarget', { targetId }); ws.close(); return windowId; } catch { return null; }
-}
-
 // page targets grouped by their OS window (CDP has no window object — we derive
 // it from Browser.getWindowForTarget). One entry per window, tabs nested, plus a
 // ready one-click `view` link. This is what /windows returns and the index renders.
@@ -230,11 +226,35 @@ server.on('upgrade', async (req, socket, head) => {
       const pendingCreate = new Set();   // client Target.createTarget request ids awaiting a targetId
       const bufferedAttach = new Map();  // targetId -> attach msg, held until a pendingCreate response claims it
       const fwd = obj => { if (client.readyState === 1) client.send(JSON.stringify(obj)); };
-      let ownWindowId = null;
+
+      // browser_tabs "new" / newPage() send Target.createTarget WITHOUT newWindow. Chrome
+      // would put that tab in the FOCUSED window — which is some OTHER agent's window
+      // (createTarget's windowId param is ignored by Chrome; verified). So we don't forward
+      // those: we run window.open() on this agent's OWN page, which by browser rule lands the
+      // new tab in this agent's window, then reply to the client with the new tab's id. The
+      // tab attaches with openerId = our page (adopted below) so the client also sees it.
+      let sideWs = null, sideSession = null, sideClient = null;
+      const createQ = [];                // FIFO of client createTarget ids awaiting their tab
+      const ensureSide = async () => {
+        if (sideClient) return;
+        sideWs = await openBrowserCDP(); sideClient = cdp(sideWs);
+        ({ sessionId: sideSession } = await sideClient.send('Target.attachToTarget', { targetId: ownTargetId, flatten: true }));
+      };
+      const translateOpen = async (url) => {
+        // window.open() places the tab in the calling page's window — but only reliably
+        // when that window is focused; under another agent's focus the tab can leak to the
+        // focused window. So bring THIS agent's window to front first (browser-level
+        // activateTarget), making placement deterministic regardless of who was being
+        // viewed. (Momentary focus steal only.)
+        try {
+          await ensureSide();
+          await sideClient.send('Target.activateTarget', { targetId: ownTargetId }).catch(() => {});
+          await sideClient.send('Runtime.evaluate', { expression: 'window.open(' + JSON.stringify(url || 'about:blank') + ", '_blank')", userGesture: true }, sideSession);
+        } catch {}
+      };
       try {
         ownTargetId = await spawnWindow('about:blank');   // dedicated window for this agent
         ownedTargets.add(ownTargetId);
-        ownWindowId = await windowIdOf(ownTargetId);       // so we can pin agent-opened tabs to THIS window
         upstream = new WS(await browserWSURL(), { headers: HDR });
         await new Promise((r, j) => { upstream.on('open', r); upstream.on('error', j); });
 
@@ -250,17 +270,16 @@ server.on('upgrade', async (req, socket, head) => {
             if (m.method === 'Target.setAutoAttach' && m.sessionId === undefined && m.params) {
               m.params.waitForDebuggerOnStart = false; s = JSON.stringify(m);
             }
-            // Remember the client's own createTarget calls (browser_tabs "new" etc.) so we
-            // can adopt the resulting tab when its targetId comes back in the response.
             if (m.method === 'Target.createTarget' && m.id !== undefined) {
-              pendingCreate.add(m.id);
-              // CRITICAL for isolation: createTarget without newWindow lands the tab in
-              // Chrome's CURRENTLY FOCUSED window — i.e. some other agent's window. Pin it
-              // to THIS agent's window so tabs never leak across agents. (CDP createTarget
-              // accepts windowId and honors it; verified.)
-              if (m.params && !m.params.newWindow && m.params.windowId === undefined && ownWindowId != null) {
-                m.params.windowId = ownWindowId; s = JSON.stringify(m);
+              if (m.params && !m.params.newWindow) {
+                // Bare createTarget -> translate to window.open on our own page so the tab
+                // lands in THIS agent's window (not the focused one). Swallow it here; the
+                // client gets its response when the new tab attaches (see below).
+                createQ.push(m.id); translateOpen(m.params.url); return;
               }
+              // Explicit newWindow: a deliberate separate window — forward as-is and adopt
+              // the result via its createTarget response.
+              pendingCreate.add(m.id);
             }
           } catch {}
           upstream.send(s);
@@ -302,10 +321,18 @@ server.on('upgrade', async (req, socket, head) => {
           if (m.method && m.method.startsWith('Target.')) {
             if (m.method === 'Target.attachedToTarget') {
               const ti = m.params.targetInfo || {};
-              const owned = ownedTargets.has(ti.targetId)
-                || (ti.openerId && ownedTargets.has(ti.openerId));   // window.open popup of an owned page
+              const ownedByOpener = ti.openerId && ownedTargets.has(ti.openerId);  // window.open child of an owned page
+              const owned = ownedTargets.has(ti.targetId) || ownedByOpener;
               if (owned) {
-                ownedTargets.add(ti.targetId); ownedSessions.add(m.params.sessionId); return fwd(m);
+                ownedTargets.add(ti.targetId); ownedSessions.add(m.params.sessionId);
+                fwd(m);
+                // If this tab is the result of a translated bare createTarget, answer the
+                // waiting client with its targetId (FIFO). A genuine agent window.open with
+                // no pending create just falls through (already forwarded above).
+                if (ownedByOpener && ti.type === 'page' && createQ.length) {
+                  fwd({ id: createQ.shift(), result: { targetId: ti.targetId } });
+                }
+                return;
               }
               // A brand-new page with no owner yet may be THIS agent's createTarget whose
               // response hasn't arrived (the attach fires a beat earlier). Hold it briefly;
@@ -331,7 +358,7 @@ server.on('upgrade', async (req, socket, head) => {
         });
 
         let ended = false;
-        const end = () => { if (ended) return; ended = true; try { client.close(); } catch {} try { upstream.close(); } catch {} if (ownTargetId) closeWindow(ownTargetId); };
+        const end = () => { if (ended) return; ended = true; try { client.close(); } catch {} try { upstream.close(); } catch {} try { sideWs && sideWs.close(); } catch {} if (ownTargetId) closeWindow(ownTargetId); };
         client.on('close', end); upstream.on('close', end); client.on('error', end); upstream.on('error', end);
       } catch (e) { try { client.close(); } catch {} if (ownTargetId) closeWindow(ownTargetId); }
     });
