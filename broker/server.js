@@ -192,10 +192,14 @@ server.on('upgrade', async (req, socket, head) => {
       const early = []; const buffer = (d) => early.push(d);
       client.on('message', buffer);
       let ownTargetId = null, upstream = null;
-      const ownedSessions = new Set();   // our page's session + its descendant (iframe/worker) sessions
+      const ownedTargets = new Set();    // top-level targets this agent owns: its window + tabs/popups IT opens
+      const ownedSessions = new Set();   // flatten-mode sessions for those targets + their iframe/worker children
+      const pendingCreate = new Set();   // client Target.createTarget request ids awaiting a targetId
+      const bufferedAttach = new Map();  // targetId -> attach msg, held until a pendingCreate response claims it
       const fwd = obj => { if (client.readyState === 1) client.send(JSON.stringify(obj)); };
       try {
         ownTargetId = await spawnWindow('about:blank');   // dedicated window for this agent
+        ownedTargets.add(ownTargetId);
         upstream = new WS(await browserWSURL(), { headers: HDR });
         await new Promise((r, j) => { upstream.on('open', r); upstream.on('error', j); });
 
@@ -211,6 +215,9 @@ server.on('upgrade', async (req, socket, head) => {
             if (m.method === 'Target.setAutoAttach' && m.sessionId === undefined && m.params) {
               m.params.waitForDebuggerOnStart = false; s = JSON.stringify(m);
             }
+            // Remember the client's own createTarget calls (browser_tabs "new" etc.) so we
+            // can adopt the resulting tab when its targetId comes back in the response.
+            if (m.method === 'Target.createTarget' && m.id !== undefined) pendingCreate.add(m.id);
           } catch {}
           upstream.send(s);
         };
@@ -218,28 +225,52 @@ server.on('upgrade', async (req, socket, head) => {
         for (const d of early) up(d);
         client.on('message', up);
 
-        // chrome -> client: show ONLY our own window target + its session subtree.
+        // chrome -> client: show ONLY targets this agent owns (its window + tabs/popups it
+        // opens) and their session subtrees. New tabs are claimed two ways: by correlating
+        // the client's createTarget request id with the response, and by openerId for popups.
         upstream.on('message', raw => {
           let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-          // session-scoped messages (flatten mode): forward only if it's one of ours
+          // session-scoped messages (flatten mode): forward only if it's one of ours.
+          // Track nested attaches so iframe/worker child sessions become owned too.
           if (m.sessionId !== undefined) {
             if (!ownedSessions.has(m.sessionId)) return;
+            if (m.method === 'Target.attachedToTarget' && m.params && m.params.sessionId) ownedSessions.add(m.params.sessionId);
+            else if (m.method === 'Target.detachedFromTarget' && m.params && m.params.sessionId) ownedSessions.delete(m.params.sessionId);
             return fwd(m);
           }
-          // command responses (id, no sessionId): trim any target listing to ours
+          // command responses (id, no sessionId)
           if (m.id !== undefined) {
+            // our createTarget came back -> adopt the new tab + flush its buffered attach
+            if (pendingCreate.has(m.id)) {
+              pendingCreate.delete(m.id);
+              const tid = m.result && m.result.targetId;
+              if (tid) {
+                ownedTargets.add(tid);
+                const buf = bufferedAttach.get(tid);
+                if (buf) { bufferedAttach.delete(tid); if (buf.params.sessionId) ownedSessions.add(buf.params.sessionId); fwd(buf); }
+              }
+            }
             if (m.result && Array.isArray(m.result.targetInfos))
-              m.result.targetInfos = m.result.targetInfos.filter(t => t.targetId === ownTargetId);
+              m.result.targetInfos = m.result.targetInfos.filter(t => ownedTargets.has(t.targetId));
             return fwd(m);
           }
-          // browser-level Target.* events: keep only our window / our sessions
+          // browser-level Target.* events: keep only our targets / our sessions
           if (m.method && m.method.startsWith('Target.')) {
             if (m.method === 'Target.attachedToTarget') {
               const ti = m.params.targetInfo || {};
-              if (ti.targetId === ownTargetId || ownedSessions.has(m.params.sessionId)) {
-                ownedSessions.add(m.params.sessionId); return fwd(m);
+              const owned = ownedTargets.has(ti.targetId)
+                || (ti.openerId && ownedTargets.has(ti.openerId));   // window.open popup of an owned page
+              if (owned) {
+                ownedTargets.add(ti.targetId); ownedSessions.add(m.params.sessionId); return fwd(m);
               }
-              return;   // foreign target attached on our upstream — hide (not paused, harmless)
+              // A brand-new page with no owner yet may be THIS agent's createTarget whose
+              // response hasn't arrived (the attach fires a beat earlier). Hold it briefly;
+              // the create response flushes it, otherwise it expires (it was a foreign tab).
+              if (ti.type === 'page') {
+                bufferedAttach.set(ti.targetId, m);
+                setTimeout(() => bufferedAttach.delete(ti.targetId), 5000);
+              }
+              return;
             }
             if (m.method === 'Target.detachedFromTarget') {
               if (ownedSessions.has(m.params.sessionId)) { ownedSessions.delete(m.params.sessionId); return fwd(m); }
@@ -247,7 +278,8 @@ server.on('upgrade', async (req, socket, head) => {
             }
             if (['Target.targetCreated', 'Target.targetInfoChanged', 'Target.targetDestroyed'].includes(m.method)) {
               const id = (m.params.targetInfo && m.params.targetInfo.targetId) || m.params.targetId;
-              return id === ownTargetId ? fwd(m) : undefined;
+              if (m.method === 'Target.targetDestroyed') ownedTargets.delete(id);
+              return ownedTargets.has(id) ? fwd(m) : undefined;
             }
             return fwd(m);
           }
