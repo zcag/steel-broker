@@ -267,6 +267,19 @@ server.on('upgrade', async (req, socket, head) => {
           let s = d.toString();
           try {
             const m = JSON.parse(s);
+            // Downloads: force every client setDownloadBehavior to write into the
+            // host-mounted /files dir with events OFF. Chrome runs in this container;
+            // a client like Playwright otherwise redirects downloads into its OWN
+            // container-side artifacts dir (allowAndName + eventsEnabled), which the
+            // host-side client can't read across the container boundary -> files vanish.
+            // Pinning downloadPath=/files (a bind mount) + eventsEnabled=false makes
+            // Chrome write the file directly, named, where the host can read it.
+            if ((m.method === 'Browser.setDownloadBehavior' || m.method === 'Page.setDownloadBehavior') && m.params) {
+              m.params.behavior = 'allow';
+              m.params.downloadPath = '/files';
+              m.params.eventsEnabled = false;
+              s = JSON.stringify(m);
+            }
             if (m.method === 'Target.setAutoAttach' && m.sessionId === undefined && m.params) {
               m.params.waitForDebuggerOnStart = false; s = JSON.stringify(m);
             }
