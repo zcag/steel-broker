@@ -10,11 +10,11 @@ N isolated windows out.
 
 ```
                        ┌────────────────────────────┐
-  agent A ─ /cdp ──▶   │  one Chrome, one profile    │
-  agent B ─ /cdp ──▶   │  ┌────────┐ ┌────────┐      │   shared cookies/logins
-  agent C ─ /cdp ──▶   │  │window A│ │window B│ ...  │   isolated windows
-                       │  └────────┘ └────────┘      │
-   you ─ /v/<lease> ─▶ │   live view + click/type    │
+  agent A ─ /cdp ──▶   │  one Chrome, one profile   │
+  agent B ─ /cdp ──▶   │  ┌────────┐ ┌────────┐     │   shared cookies/logins
+  agent C ─ /cdp ──▶   │  │window A│ │window B│ ... │   isolated windows
+                       │  └────────┘ └────────┘     │
+   you ─ /v/<lease> ─▶ │   live view + click/type   │
                        └────────────────────────────┘
 ```
 
