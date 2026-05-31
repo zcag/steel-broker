@@ -1,0 +1,43 @@
+# steel-broker — full stack: one Steel browser + the broker sidecar.
+# `docker compose up` and you have N isolated agent windows behind one CDP
+# endpoint, each with a live view/takeover link.
+#
+# Ports bind to 127.0.0.1 by default — change BIND_ADDR for a trusted LAN/tailnet
+# IP. Do NOT expose to the public internet: a shared cookie jar means anyone with
+# access has every logged-in session.
+
+services:
+  chrome:
+    image: ghcr.io/steel-dev/steel-browser-api:latest
+    container_name: steel-chrome
+    restart: unless-stopped
+    ports:
+      # The broker shares this container's netns, so the broker's port (3030) is
+      # published HERE, not on the broker service. 3000 = Steel's REST/API.
+      - "${BIND_ADDR:-127.0.0.1}:3000:3000"
+      - "${BIND_ADDR:-127.0.0.1}:3030:3030"
+    volumes:
+      # Persistent profile = shared logins/cookies survive restarts.
+      - ./data/profile:/data/chrome-profile
+    environment:
+      # REQUIRED: Steel's stealth fingerprint generator crash-loops browser
+      # launch ("Failed to generate a consistent fingerprint") — turn it off.
+      - SKIP_FINGERPRINT_INJECTION=true
+      # Persist the profile (default /tmp is ephemeral).
+      - CHROME_USER_DATA_DIR=/data/chrome-profile
+
+  broker:
+    build: ./broker
+    # image: ghcr.io/zcag/steel-broker:latest   # or pull a published image
+    container_name: steel-broker
+    restart: unless-stopped
+    init: true
+    # THE KEY LINE: share Chrome's network namespace so the broker reaches CDP at
+    # localhost:9222 directly. Because of this, the broker has no ports of its own
+    # (they're published on the chrome service above) and no `networks:` block.
+    network_mode: "service:chrome"
+    environment:
+      - CHROME=localhost:9222
+      - PORT=3030
+    depends_on:
+      - chrome

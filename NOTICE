@@ -1,0 +1,14 @@
+steel-broker
+Copyright (c) 2026 Cagdas Salur
+
+This product bundles `broker/player.ejs`, which is the session-player template
+from Steel (steel-dev/steel-browser), used verbatim and unmodified.
+
+  Steel — https://github.com/steel-dev/steel-browser
+  Licensed under the Apache License, Version 2.0.
+
+The broker renders this template with its own parameters (a window-scoped
+WebSocket URL) to provide a per-window live viewer. No bytes of the template
+are changed. To update it after a Steel upgrade, copy the current
+`/app/api/src/templates/live-session-streamer.ejs` from the Steel image over
+`broker/player.ejs`.
