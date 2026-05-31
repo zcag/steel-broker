@@ -88,12 +88,18 @@ windows. Tabs opened *within* a window stay grouped under that agent.
 | Endpoint | Who | What |
 |---|---|---|
 | `ws://host:3030/cdp` | agents | CDP; 1 connection = 1 isolated window |
-| `http://host:3030/` | humans | list windows, spawn, get viewer links |
+| `http://host:3030/` | humans | per-window list + one-click view links + spawn |
+| `GET /view/<targetId>` | anyone | one-shot link → 302 to that window's live viewer |
 | `http://host:3030/v/<lease>` | humans | live viewer + click/type takeover |
-| `GET /windows` | — | list current windows |
+| `GET /windows` | agents | windows (grouped by window); each has tabs[] + a ready `view` URL |
 | `POST /spawn {url?}` | — | open + lease a fresh window → `{leaseId, viewer}` |
-| `POST /lease {targetId}` | — | get a viewer link for an existing window |
-| `DELETE /lease/:id` | — | close the window |
+| `POST /lease {targetId}` | — | mint a viewer link for an existing window |
+| `DELETE /lease/:id` | — | drop the lease (closes the window only if spawned via /spawn) |
+
+**Giving someone a link to watch an agent:** the agent (or you) GETs `/windows`, finds the
+window whose `tabs[]` contains the page it's driving, and hands over that entry's `view` URL —
+e.g. `http://host:3030/view/<targetId>`. That single link lands directly on the live player
+(no list, no extra clicks). `/view` reuses an existing lease for the window or mints one.
 
 ## Configuration
 
