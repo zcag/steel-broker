@@ -106,6 +106,10 @@ async function closeWindow(targetId) {
   try { const ws = await openBrowserCDP(); const c = cdp(ws); await c.send('Target.closeTarget', { targetId }); ws.close(); } catch {}
 }
 
+async function windowIdOf(targetId) {
+  try { const ws = await openBrowserCDP(); const c = cdp(ws); const { windowId } = await c.send('Browser.getWindowForTarget', { targetId }); ws.close(); return windowId; } catch { return null; }
+}
+
 // page targets grouped by their OS window (CDP has no window object — we derive
 // it from Browser.getWindowForTarget). One entry per window, tabs nested, plus a
 // ready one-click `view` link. This is what /windows returns and the index renders.
@@ -226,9 +230,11 @@ server.on('upgrade', async (req, socket, head) => {
       const pendingCreate = new Set();   // client Target.createTarget request ids awaiting a targetId
       const bufferedAttach = new Map();  // targetId -> attach msg, held until a pendingCreate response claims it
       const fwd = obj => { if (client.readyState === 1) client.send(JSON.stringify(obj)); };
+      let ownWindowId = null;
       try {
         ownTargetId = await spawnWindow('about:blank');   // dedicated window for this agent
         ownedTargets.add(ownTargetId);
+        ownWindowId = await windowIdOf(ownTargetId);       // so we can pin agent-opened tabs to THIS window
         upstream = new WS(await browserWSURL(), { headers: HDR });
         await new Promise((r, j) => { upstream.on('open', r); upstream.on('error', j); });
 
@@ -246,7 +252,16 @@ server.on('upgrade', async (req, socket, head) => {
             }
             // Remember the client's own createTarget calls (browser_tabs "new" etc.) so we
             // can adopt the resulting tab when its targetId comes back in the response.
-            if (m.method === 'Target.createTarget' && m.id !== undefined) pendingCreate.add(m.id);
+            if (m.method === 'Target.createTarget' && m.id !== undefined) {
+              pendingCreate.add(m.id);
+              // CRITICAL for isolation: createTarget without newWindow lands the tab in
+              // Chrome's CURRENTLY FOCUSED window — i.e. some other agent's window. Pin it
+              // to THIS agent's window so tabs never leak across agents. (CDP createTarget
+              // accepts windowId and honors it; verified.)
+              if (m.params && !m.params.newWindow && m.params.windowId === undefined && ownWindowId != null) {
+                m.params.windowId = ownWindowId; s = JSON.stringify(m);
+              }
+            }
           } catch {}
           upstream.send(s);
         };
