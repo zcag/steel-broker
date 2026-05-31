@@ -95,11 +95,6 @@ async function openBrowserCDP() {
 const leases = new Map();
 const newLeaseId = () => 'L' + crypto.randomBytes(6).toString('hex');
 
-async function listPages() {
-  const list = await getJSON('/json/list');
-  return list.filter(t => t.type === 'page').map(t => ({ id: t.id, title: t.title, url: t.url }));
-}
-
 async function spawnWindow(url) {
   const ws = await openBrowserCDP(); const c = cdp(ws);
   const { targetId } = await c.send('Target.createTarget', { url: url || 'about:blank', newWindow: true });
@@ -111,13 +106,35 @@ async function closeWindow(targetId) {
   try { const ws = await openBrowserCDP(); const c = cdp(ws); await c.send('Target.closeTarget', { targetId }); ws.close(); } catch {}
 }
 
-// idle reaper: drop+close leases with no viewers, untouched past TTL.
-// (Agent-only windows stay alive via /lease touch; viewers refresh lastSeen.)
+// page targets grouped by their OS window (CDP has no window object — we derive
+// it from Browser.getWindowForTarget). One entry per window, tabs nested, plus a
+// ready one-click `view` link. This is what /windows returns and the index renders.
+async function listWindows(host) {
+  const ws = await openBrowserCDP(); const c = cdp(ws);
+  try {
+    const pages = (await getJSON('/json/list')).filter(t => t.type === 'page');
+    const byWin = new Map();
+    for (const p of pages) {
+      let wid; try { wid = (await c.send('Browser.getWindowForTarget', { targetId: p.id })).windowId; } catch { wid = 'unknown'; }
+      if (!byWin.has(wid)) byWin.set(wid, []);
+      byWin.get(wid).push({ id: p.id, title: p.title, url: p.url });
+    }
+    const base = host ? 'http://' + host : '';
+    return [...byWin.entries()].map(([windowId, tabs]) => ({
+      windowId, tabs, view: base + '/view/' + tabs[0].id,
+    }));
+  } finally { ws.close(); }
+}
+
+// idle reaper: drop leases with no viewers, untouched past TTL. Only CLOSE the
+// underlying window if WE spawned it (POST /spawn). Leases that merely VIEW an
+// existing window (POST /lease, GET /view — typically an agent's window) just get
+// dropped; we must never auto-close a window we didn't open.
 setInterval(() => {
   const now = Date.now();
   for (const [id, L] of leases) {
     if (L.viewers.size === 0 && now - L.lastSeen > IDLE_TTL_MS) {
-      leases.delete(id); closeWindow(L.targetId);
+      leases.delete(id); if (L.spawned) closeWindow(L.targetId);
     }
   }
 }, 60000).unref();
@@ -139,13 +156,14 @@ const server = http.createServer(async (req, res) => {
       return send(200, await getJSON('/json/list'));
     }
 
-    if (u.pathname === '/windows' && req.method === 'GET') return send(200, await listPages());
+    // window-grouped list, each entry with a ready /view link (agents relay `.view`)
+    if (u.pathname === '/windows' && req.method === 'GET') return send(200, await listWindows(req.headers.host));
 
     if (u.pathname === '/lease' && req.method === 'POST') {
       const body = await readBody(req); const { targetId } = JSON.parse(body || '{}');
       if (!targetId) return send(400, { error: 'targetId required' });
       const leaseId = newLeaseId();
-      leases.set(leaseId, { targetId, viewers: new Set(), lastSeen: Date.now() });
+      leases.set(leaseId, { targetId, spawned: false, viewers: new Set(), lastSeen: Date.now() });
       return send(200, { leaseId, viewer: '/v/' + leaseId });
     }
 
@@ -153,14 +171,25 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req); const { url } = JSON.parse(body || '{}');
       const targetId = await spawnWindow(url);
       const leaseId = newLeaseId();
-      leases.set(leaseId, { targetId, viewers: new Set(), lastSeen: Date.now() });
+      leases.set(leaseId, { targetId, spawned: true, viewers: new Set(), lastSeen: Date.now() });
       return send(200, { leaseId, targetId, viewer: '/v/' + leaseId });
+    }
+
+    // One-shot link to a window's live view: reuse a lease for this target or mint
+    // one (viewing only — never marks it spawned), then redirect to the player.
+    const view = u.pathname.match(/^\/view\/([0-9A-Fa-f]+)$/);
+    if (view && req.method === 'GET') {
+      const targetId = view[1];
+      let leaseId = null;
+      for (const [lid, L] of leases) if (L.targetId === targetId) { leaseId = lid; break; }
+      if (!leaseId) { leaseId = newLeaseId(); leases.set(leaseId, { targetId, spawned: false, viewers: new Set(), lastSeen: Date.now() }); }
+      res.writeHead(302, { Location: '/v/' + leaseId }); return res.end();
     }
 
     const del = u.pathname.match(/^\/lease\/(L[0-9a-f]+)$/);
     if (del && req.method === 'DELETE') {
       const L = leases.get(del[1]); if (!L) return send(404, { error: 'no such lease' });
-      leases.delete(del[1]); await closeWindow(L.targetId); return send(200, { ok: true });
+      leases.delete(del[1]); if (L.spawned) await closeWindow(L.targetId); return send(200, { ok: true });
     }
 
     const mv = u.pathname.match(/^\/v\/(L[0-9a-f]+)$/);
@@ -393,8 +422,15 @@ function indexHTML() {
 <p><button onclick="spawn()">+ spawn new window</button></p>
 <div id=list>loading…</div>
 <script>
-function refresh(){fetch('/windows').then(r=>r.json()).then(ws=>{document.getElementById('list').innerHTML=ws.length?ws.map(w=>'<p><b>'+(w.title||'(untitled)')+'</b> <small>'+(w.url||'')+'</small><br><button onclick="lease(\\''+w.id+'\\')">open viewer link</button> <span id="o'+w.id+'"></span></p>').join(''):'<i>no windows</i>';});}
-function lease(id){fetch('/lease',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({targetId:id})}).then(r=>r.json()).then(j=>{document.getElementById('o'+id).innerHTML=' &rarr; <a target=_blank href="'+j.viewer+'">'+location.origin+j.viewer+'</a>';});}
+// One row per WINDOW (tabs grouped); each row is a direct one-click link to that
+// window's live view. window.open(view) follows the /view -> /v/<lease> redirect.
+function refresh(){fetch('/windows').then(r=>r.json()).then(ws=>{
+  document.getElementById('list').innerHTML = ws.length ? ws.map(function(w){
+    var tabs = w.tabs.map(function(t){return '&nbsp;&nbsp;• '+((t.title||t.url||'tab').replace(/</g,'&lt;'))+' <small>'+(t.url||'')+'</small>';}).join('<br>');
+    var label = (w.tabs[0] && (w.tabs[0].title||w.tabs[0].url)) || 'window';
+    return '<p><a href="'+w.view+'" target=_blank><b>▶ view window</b></a> — '+w.tabs.length+' tab'+(w.tabs.length>1?'s':'')+'<br>'+tabs+'</p>';
+  }).join('') : '<i>no windows</i>';
+});}
 function spawn(){fetch('/spawn',{method:'POST',headers:{'content-type':'application/json'},body:'{}'}).then(r=>r.json()).then(j=>{window.open(j.viewer,'_blank');setTimeout(refresh,500);});}
 refresh();setInterval(refresh,5000);
 </script>`;
